@@ -1,0 +1,86 @@
+package Project
+
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import Project.config.Settings._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.DataTypes
+
+object JobMaster extends  App {
+
+  implicit val spark= SparkSession.builder().appName("Job Master")
+    .config("spark.master", "local")
+    .getOrCreate()
+
+  val key_list = List("MASTER_ID","GROUP_ID","SITE_NM","COUNTRY_NM")
+
+  spark.read.format("csv").option("header","true").load(s"$jobmaster").createOrReplaceGlobalTempView("JobMaster_Source")
+  spark.read.format("csv").option("header","true").load(s"$jobmaster_tar").createOrReplaceGlobalTempView("JobMaster_Target")
+
+val df_cdc=
+ spark.sql(
+    """
+        |select
+        |JobMaster_Target.MASTER_ID as MASTER_ID,
+        |case when JobMaster_Target.GROUP_ID is null then 0 else cast(JobMaster_Target.GROUP_ID as INT) end as GROUP_ID,
+        |JobMaster_Source.SITE_NM as SITE_NM,
+        |JobMaster_Target.SITE_NM as TAR_SITE_NM,
+        |JobMaster_Source.COUNTRY_NM as COUNTRY_NM,
+        |JobMaster_Source.SITE_DESC as SITE_DESC,
+        |JobMaster_Source.PLUG_TYPE as PLUG_TYPE,
+        |JobMaster_Source.PLUG_NM as PLUG_NM,
+        |JobMaster_Source.SOURCE_NM as SOURCE_NM,
+        |JobMaster_Source.IS_ACTIVE as IS_ACTIVE,
+        |JobMaster_Source.FILE_NM as FILE_NM
+        |from
+        |global_temp.JobMaster_Source left join global_temp.JobMaster_Target on
+        |JobMaster_Source.SITE_NM=JobMaster_Target.SITE_NM and
+        |JobMaster_Source.COUNTRY_NM=JobMaster_Target.COUNTRY_NM and
+        |JobMaster_Source.PLUG_TYPE=JobMaster_Target.PLUG_TYPE and
+        |JobMaster_Source.PLUG_NM=JobMaster_Target.PLUG_NM
+    """.stripMargin)//.createOrReplaceGlobalTempView("jb_cdc_data")
+
+  df_cdc.createOrReplaceGlobalTempView("JmCdc")
+
+       val df_grp_jm=  df_cdc
+        .select(df_cdc("SITE_NM"),df_cdc("GROUP_ID"))
+        .distinct
+        .groupBy("SITE_NM")
+        .max("GROUP_ID")
+         df_grp_jm.withColumnRenamed("max(GROUP_ID)","GROUP_ID").createOrReplaceGlobalTempView("find_grp")
+
+        spark.
+        read.format("csv")
+        .option("header","true")
+        .load(s"$jobmaster_tar")
+        .select("GROUP_ID" )
+        .withColumnRenamed("GROUP_ID","MAX_GROUP_ID").createOrReplaceGlobalTempView("max_grp")
+
+
+   val distinctValuesDF =spark.sql(
+     """
+       |select
+       |trim(find_grp.SITE_NM) as SITE_NM,
+       |cast(row_number() over ( order by find_grp.SITE_NM)  + mx.MAX_GROUP_ID as INT) as GROUP_ID
+       |from
+       |global_temp.find_grp cross join (select max(MAX_GROUP_ID) as MAX_GROUP_ID from global_temp.max_grp) mx where find_grp.GROUP_ID = 0
+       |union all
+       |select trim(find_grp.SITE_NM) as SITE_NM, find_grp.GROUP_ID from global_temp.find_grp where find_grp.GROUP_ID  <> 0
+     """.stripMargin)
+
+  val maxValue = df_cdc.agg( max("MASTER_ID"))
+  val new_rec=df_cdc.filter(col("MASTER_ID").isNull).drop("MASTER_ID")
+
+  import org.apache.spark.sql.expressions.Window
+
+  val new_with_master=new_rec
+    .crossJoin(maxValue)
+    .withColumn("MASTER_ID",(maxValue("max(MASTER_ID)")+ row_number().over(Window.partitionBy("GROUP_ID").orderBy("GROUP_ID")) ).cast(DataTypes.IntegerType))
+    .drop("GROUP_ID")
+    .drop("max(MASTER_ID)")
+    .drop("TAR_SITE_NM")
+
+val final_new = new_with_master.join(
+  distinctValuesDF
+    , new_with_master("SITE_NM") === distinctValuesDF("SITE_NM")
+    , "inner") .select("*").show(100)
+}
